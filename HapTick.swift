@@ -134,8 +134,11 @@ final class Haptics {
 enum AppFilter {
     // Some apps (e.g. WhatsApp) prefix their name with invisible direction marks.
     static func clean(_ name: String) -> String {
-        String(String.UnicodeScalarView(name.unicodeScalars.filter { $0.properties.generalCategory != .format }))
+        let n = String(String.UnicodeScalarView(name.unicodeScalars.filter { $0.properties.generalCategory != .format }))
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        // FaceTime/Phone banners sometimes show an untranslated key like "FACETIME_NOTIFICATION".
+        if n.hasPrefix("FACETIME_") { return "FaceTime" }
+        return n
     }
 
     // Tidy up names saved before clean() existed, merging duplicates.
