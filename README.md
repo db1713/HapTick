@@ -4,7 +4,11 @@ Feel your notifications. HapTick is a tiny macOS menu bar app that buzzes your M
 Force Touch trackpad (the Taptic Engine) when a notification arrives — WhatsApp, Outlook,
 Teams, Calendar, anything that shows a banner — so you notice it even with the sound off.
 
-<p align="center"><img src="docs/screenshot.png" alt="HapTick menu bar panel" width="346"></p>
+<p align="center">
+  <img src="docs/screenshot.png" alt="HapTick menu bar panel" width="300">
+  &nbsp;&nbsp;
+  <img src="docs/screenshot-apps.png" alt="HapTick panel with the app list expanded" width="300">
+</p>
 
 ## Features
 
