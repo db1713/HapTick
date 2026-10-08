@@ -25,33 +25,56 @@ enum Strength: Int, CaseIterable, Identifiable {
 }
 
 enum Key {
-    static let enabled = "enabled"
+    static let enabled = "enabled" // old on/off switch, migrated to Pause
     static let pattern = "pattern"
     static let strength = "strength"
-    static let onlyWhenActive = "onlyWhenActive"
+    static let pausedUntil = "pausedUntil"
     static let buzzCalls = "buzzCalls"
     static let knownApps = "knownApps"
     static let mutedApps = "mutedApps"
     static let buzzNewApps = "buzzNewApps"
     static let debugLog = "debugLog"
+    static let messageCooldown = "messageCooldown"
 }
 
 let defaults: UserDefaults = {
     let d = UserDefaults.standard
     d.register(defaults: [
-        Key.enabled: true,
         Key.pattern: Pattern.notify.rawValue,
         Key.strength: Strength.strong.rawValue,
-        Key.onlyWhenActive: true,
+        Key.pausedUntil: 0.0,
         Key.buzzCalls: true,
         Key.knownApps: ["WhatsApp", "Microsoft Outlook", "Microsoft Teams", "Calendar", "Reminders",
                         "Messages", "Mail", "FaceTime", "Phone"],
         Key.mutedApps: [String](),
         Key.buzzNewApps: true,
         Key.debugLog: false,
+        Key.messageCooldown: 30,
     ])
     return d
 }()
+
+// MARK: - Pause
+
+// Pausing silences notification buzzes (not Test Buzz or the timer).
+// Stored as seconds since 1970; 0 means not paused, -1 means until resumed.
+enum Pause {
+    static let untilResumed: Double = -1
+
+    /// When the pause ends, `.distantFuture` if it lasts until resumed, or nil if not paused.
+    static var until: Date? {
+        let value = defaults.double(forKey: Key.pausedUntil)
+        if value == untilResumed { return .distantFuture }
+        return value > Date().timeIntervalSince1970 ? Date(timeIntervalSince1970: value) : nil
+    }
+
+    static func start(minutes: Int?) {
+        let value = minutes.map { Date().addingTimeInterval(TimeInterval($0 * 60)).timeIntervalSince1970 } ?? untilResumed
+        defaults.set(value, forKey: Key.pausedUntil)
+    }
+
+    static func resume() { defaults.set(0.0, forKey: Key.pausedUntil) }
+}
 
 // MARK: - Haptics
 
@@ -166,22 +189,79 @@ enum AppFilter {
     }
 }
 
+// MARK: - Source tags
+
+// Labels where an app's notifications come from. Anything that isn't a Mac app,
+// a Chrome web app or a known macOS system source was forwarded from the iPhone.
+enum SourceTag {
+    // System notifications with no app on disk (AirDrop is prefix-matched).
+    private static let system: Set<String> = [
+        "Bluetooth", "Wi-Fi", "Software Update", "Time Machine", "Screen Time", "Focus", "Low Battery", "Siri",
+    ]
+    private static var macNames = Set<String>()
+    private static var chromeAppNames = Set<String>()
+    private static var builtAt = Date.distantPast
+
+    static func tag(for app: String) -> String? {
+        if chromeAppNames.contains(app) { return "Chrome" }
+        if macNames.contains(app) || system.contains(app) || app.hasPrefix("AirDrop") { return nil }
+        return "iPhone"
+    }
+
+    /// Rescans installed apps, at most once a minute.
+    static func refresh() {
+        guard Date().timeIntervalSince(builtAt) > 60 else { return }
+        builtAt = Date()
+        let fm = FileManager.default
+        var names = Set<String>()
+        // Apps registered for notifications, including system bundles like Calendar's.
+        let registered = CFPreferencesCopyAppValue("apps" as CFString, "com.apple.ncprefs" as CFString) as? [[String: Any]] ?? []
+        for entry in registered {
+            if let path = entry["path"] as? String, !path.isEmpty, let n = bundleName(path) { names.insert(n) }
+        }
+        let home = NSHomeDirectory()
+        for dir in ["/Applications", "/Applications/Utilities", "/System/Applications",
+                    "/System/Applications/Utilities", home + "/Applications"] {
+            names.formUnion(appNames(in: dir))
+        }
+        macNames = names
+        chromeAppNames = appNames(in: home + "/Applications/Chrome Apps.localized")
+    }
+
+    private static func appNames(in dir: String) -> Set<String> {
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        return Set(files.filter { $0.hasSuffix(".app") }.flatMap { f -> [String] in
+            let path = dir + "/" + f
+            return [bundleName(path), String(f.dropLast(4))].compactMap { $0 }
+        })
+    }
+
+    private static func bundleName(_ path: String) -> String? {
+        guard let b = Bundle(path: path) else { return nil }
+        let keys = ["CFBundleDisplayName", "CFBundleName"]
+        for dict in [b.localizedInfoDictionary, b.infoDictionary] {
+            for k in keys { if let n = dict?[k] as? String, !n.isEmpty { return n } }
+        }
+        return nil
+    }
+}
+
 // MARK: - Notification watcher
 
 final class Watcher {
     private let ringRepeat: TimeInterval = 2
     private let ringMax: TimeInterval = 45
-    private let idleLimit: TimeInterval = 120
 
     private var seen = Set<String>()
     private var ringStart: [String: Date] = [:]
     private var lastRing = Date.distantPast
+    private var lastMessageBuzz: [String: Date] = [:]
 
     func start() {
         let t = Thread { [self] in
             while true {
                 usleep(400_000)
-                if defaults.bool(forKey: Key.enabled), AXIsProcessTrusted() { tick() } else { seen = [] }
+                if AXIsProcessTrusted() { tick() } else { seen = [] }
             }
         }
         t.qualityOfService = .utility
@@ -213,28 +293,34 @@ final class Watcher {
         let buzzCalls = defaults.bool(forKey: Key.buzzCalls)
         for b in fresh where b.ringing && buzzCalls { ringStart[b.key] = Date() }
 
-        guard userActive() else { return }
+        guard Pause.until == nil else { return }
         let now = Date()
-        if !fresh.isEmpty {
-            if fresh.contains(where: \.ringing) && buzzCalls { ring(now) } else { Haptics.shared.playSaved() }
+        // Calls always get through. Messages from an app that buzzed within the
+        // cooldown are grouped into that earlier buzz, so a busy chat buzzes once.
+        let calls = fresh.filter(\.ringing)
+        let cooldown = TimeInterval(defaults.integer(forKey: Key.messageCooldown))
+        let messages = fresh.filter { b in
+            !b.ringing && now.timeIntervalSince(lastMessageBuzz[b.app] ?? .distantPast) >= cooldown
+        }
+        let grouped = fresh.count - calls.count - messages.count
+        if grouped > 0 { writeLog("grouped \(grouped) message(s) into an earlier buzz") }
+        if !calls.isEmpty && buzzCalls {
+            writeLog("buzz: call")
+            ring(now)
+        } else if !calls.isEmpty || !messages.isEmpty {
+            writeLog("buzz: message")
+            Haptics.shared.playSaved()
         } else if ringStart.values.contains(where: { now.timeIntervalSince($0) < ringMax }),
                   now.timeIntervalSince(lastRing) >= ringRepeat {
             ring(now)
         }
+        for b in messages { lastMessageBuzz[b.app] = now }
     }
 
     private func ring(_ now: Date) {
         let strength = Strength(rawValue: defaults.integer(forKey: Key.strength)) ?? .strong
         Haptics.shared.play(.alert, strength: strength)
         lastRing = now
-    }
-
-    private func userActive() -> Bool {
-        guard defaults.bool(forKey: Key.onlyWhenActive) else { return true }
-        if let s = CGSessionCopyCurrentDictionary() as? [String: Any],
-           (s["CGSSessionScreenIsLocked"] as? Bool) == true { return false }
-        let anyInput = CGEventType(rawValue: ~0)!
-        return CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput) < idleLimit
     }
 
     private func collect(_ e: AXUIElement, _ depth: Int = 0, into out: inout [Banner]) {
@@ -280,7 +366,12 @@ final class Watcher {
             let kids = depth < 4 ? (attr(e, "AXChildren") as? [AXUIElement] ?? []) : []
             return kids.isEmpty ? s : s + "{" + kids.map { shape($0, depth + 1) }.joined(separator: " ") + "}"
         }
-        let line = "\(Date()) app=\(b.app) call=\(b.ringing) \(shape(b.element, 0))\n"
+        writeLog("app=\(b.app) call=\(b.ringing) \(shape(b.element, 0))")
+    }
+
+    private func writeLog(_ message: String) {
+        guard defaults.bool(forKey: Key.debugLog) else { return }
+        let line = "\(Date()) \(message)\n"
         let url = URL(fileURLWithPath: NSString(string: "~/Library/Logs/HapTick.log").expandingTildeInPath)
         if let h = try? FileHandle(forWritingTo: url) {
             h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
@@ -350,6 +441,7 @@ final class AppState: ObservableObject {
     @Published private(set) var now = Date()
     @Published private(set) var knownApps: [String] = []
     @Published private(set) var mutedApps: [String] = []
+    @Published private(set) var pausedUntil = Pause.until
     private var lastDoneBuzz = Date.distantPast
 
     init() {
@@ -362,6 +454,8 @@ final class AppState: ObservableObject {
         let t = AXIsProcessTrusted()
         if trusted != t { trusted = t }
         loadApps()
+        let paused = Pause.until // timed pauses end on their own
+        if paused != pausedUntil { pausedUntil = paused }
 
         if let end = timerEnd, now >= end {
             timerEnd = nil
@@ -386,8 +480,27 @@ final class AppState: ObservableObject {
     private func loadApps() {
         let known = (defaults.stringArray(forKey: Key.knownApps) ?? []).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         let muted = defaults.stringArray(forKey: Key.mutedApps) ?? []
-        if known != knownApps { knownApps = known }
+        if known != knownApps {
+            SourceTag.refresh()
+            knownApps = known
+        }
         if muted != mutedApps { mutedApps = muted }
+    }
+
+    func pause(minutes: Int?) {
+        Pause.start(minutes: minutes)
+        pausedUntil = Pause.until
+    }
+
+    func resume() {
+        Pause.resume()
+        pausedUntil = nil
+    }
+
+    var pauseText: String? {
+        guard let until = pausedUntil else { return nil }
+        if until == .distantFuture { return "Paused until you resume" }
+        return "Paused until \(until.formatted(date: .omitted, time: .shortened))"
     }
 
     func setMuted(_ app: String, _ muted: Bool) {
@@ -432,28 +545,44 @@ final class AppState: ObservableObject {
 
 struct MenuContent: View {
     @ObservedObject var state: AppState
-    @AppStorage(Key.enabled) var enabled = true
     @AppStorage(Key.pattern) var pattern = Pattern.notify.rawValue
     @AppStorage(Key.strength) var strength = Strength.strong.rawValue
-    @AppStorage(Key.onlyWhenActive) var onlyWhenActive = true
     @AppStorage(Key.buzzCalls) var buzzCalls = true
     @AppStorage(Key.buzzNewApps) var buzzNewApps = true
     @AppStorage(Key.debugLog) var debugLog = false
+    @AppStorage(Key.messageCooldown) var messageCooldown = 30
+    @AppStorage("appsExpanded") var appsExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("HapTick").font(.headline)
-                Spacer()
-                Toggle("", isOn: $enabled).toggleStyle(.switch).labelsHidden()
-                    .help("Buzz on notifications")
-            }
+            Text("HapTick").font(.headline)
 
             if !state.trusted {
                 VStack(alignment: .leading, spacing: 6) {
                     Label("Accessibility access needed to see notifications", systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange).font(.callout)
                     Button("Grant Access…") { state.requestAccess() }
+                }
+            }
+
+            section("Pause") {
+                if let text = state.pauseText {
+                    HStack {
+                        Label(text, systemImage: "pause.circle.fill").foregroundStyle(.orange)
+                        Spacer()
+                        Button("Resume") { state.resume() }
+                    }
+                } else {
+                    Menu("Pause buzzes for…") {
+                        Button("15 minutes") { state.pause(minutes: 15) }
+                        Button("30 minutes") { state.pause(minutes: 30) }
+                        Button("1 hour") { state.pause(minutes: 60) }
+                        Button("2 hours") { state.pause(minutes: 120) }
+                        Divider()
+                        Button("Until I turn them back on") { state.pause(minutes: nil) }
+                    }
+                    .fixedSize()
+                    .help("Silences notification buzzes. Test Buzz and the timer still work.")
                 }
             }
 
@@ -464,6 +593,19 @@ struct MenuContent: View {
                 Picker("Strength", selection: $strength) {
                     ForEach(Strength.allCases) { Text($0.title).tag($0.rawValue) }
                 }.pickerStyle(.segmented)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Group Burst Alerts ") + Text("(choose cooldown)").foregroundColor(.secondary)
+                    Picker("Group Burst Alerts", selection: $messageCooldown) {
+                        Text("Off").tag(0)
+                        Text("10s").tag(10)
+                        Text("30s").tag(30)
+                        Text("1m").tag(60)
+                        Text("5m").tag(300)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                }
+                .help("After a buzz, more messages from the same app stay silent for this long. Calls always buzz.")
                 Button("Test Buzz") { Haptics.shared.playSaved() }
             }
 
@@ -491,20 +633,39 @@ struct MenuContent: View {
             }
 
             section("Apps") {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(state.knownApps, id: \.self) { app in
-                            Toggle(app, isOn: Binding(get: { !state.mutedApps.contains(app) },
-                                                      set: { state.setMuted(app, !$0) }))
+                Button { appsExpanded.toggle() } label: {
+                    HStack {
+                        Image(systemName: "chevron.right")
+                            .rotationEffect(.degrees(appsExpanded ? 90 : 0))
+                            .foregroundStyle(.secondary)
+                        Text(appsSummary)
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if appsExpanded {
+                    let rows = (state.knownApps.count + 1) / 2
+                    ScrollView {
+                        LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading),
+                                            GridItem(.flexible(), alignment: .leading)],
+                                  alignment: .leading, spacing: 4) {
+                            ForEach(state.knownApps, id: \.self) { app in
+                                Toggle(isOn: Binding(get: { !state.mutedApps.contains(app) },
+                                                     set: { state.setMuted(app, !$0) })) {
+                                    tagged(app).lineLimit(1).truncationMode(.tail)
+                                }
+                                .help(SourceTag.tag(for: app).map { "\(app) (\($0))" } ?? app)
+                            }
                         }
-                    }.frame(maxWidth: .infinity, alignment: .leading)
-                }.frame(height: min(CGFloat(state.knownApps.count) * 22, 200))
+                    }
+                    .frame(height: min(CGFloat(rows) * 22, 220))
+                }
                 Toggle("Buzz for new apps", isOn: $buzzNewApps)
             }
 
             section("Options") {
                 Toggle("Keep buzzing for calls", isOn: $buzzCalls)
-                Toggle("Only when I'm using the Mac", isOn: $onlyWhenActive)
                 Toggle("Start at login", isOn: Binding(get: { state.launchAtLogin }, set: { state.setLaunchAtLogin($0) }))
                 Toggle("Debug log", isOn: $debugLog)
                     .help("Writes app names and banner layout (never message text) to ~/Library/Logs/HapTick.log")
@@ -519,6 +680,19 @@ struct MenuContent: View {
         .toggleStyle(.checkbox)
         .padding(16)
         .frame(width: 300)
+        .fixedSize()
+        .background(PanelResizer())
+    }
+
+    private func tagged(_ app: String) -> Text {
+        guard let tag = SourceTag.tag(for: app) else { return Text(app) }
+        return Text(app) + Text(" (\(tag))").foregroundColor(.secondary)
+    }
+
+    private var appsSummary: String {
+        let total = state.knownApps.count
+        let on = state.knownApps.filter { !state.mutedApps.contains($0) }.count
+        return on == total ? "All \(total) apps buzz" : "\(on) of \(total) apps buzz"
     }
 
     @ViewBuilder
@@ -530,15 +704,47 @@ struct MenuContent: View {
     }
 }
 
+// MenuBarExtra panels grow but never shrink on their own. This view sits behind the
+// content, so it always has the content's size; when that changes, it resizes the
+// panel to match, keeping the top edge under the menu bar.
+private struct PanelResizer: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { ResizingView() }
+    func updateNSView(_ view: NSView, context: Context) {}
+
+    final class ResizingView: NSView {
+        override func setFrameSize(_ newSize: NSSize) {
+            super.setFrameSize(newSize)
+            DispatchQueue.main.async { [weak self] in self?.fitWindow() }
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            DispatchQueue.main.async { [weak self] in self?.fitWindow() }
+        }
+
+        private func fitWindow() {
+            guard let window, bounds.width > 0, bounds.height > 0 else { return }
+            let target = window.frameRect(forContentRect: NSRect(origin: .zero, size: bounds.size)).size
+            var frame = window.frame
+            guard abs(frame.height - target.height) > 0.5 || abs(frame.width - target.width) > 0.5 else { return }
+            frame.origin.y += frame.height - target.height
+            frame.size = target
+            window.setFrame(frame, display: true)
+        }
+    }
+}
+
 @main
 struct HapTickApp: App {
     @StateObject private var state = AppState()
-    @AppStorage(Key.enabled) private var enabled = true
     private let watcher = Watcher()
 
     init() {
         if CommandLine.arguments.contains("--self-test") { runSelfTest() }
         AppFilter.migrate()
+        // The on/off switch was replaced by Pause; keep anyone who had it off paused.
+        if defaults.object(forKey: Key.enabled) as? Bool == false { Pause.start(minutes: nil) }
+        defaults.removeObject(forKey: Key.enabled)
         watcher.start()
     }
 
@@ -546,7 +752,7 @@ struct HapTickApp: App {
         MenuBarExtra {
             MenuContent(state: state)
         } label: {
-            let icon = Image(systemName: enabled ? "hand.tap.fill" : "hand.tap")
+            let icon = Image(systemName: state.pausedUntil != nil ? "pause.circle" : "hand.tap.fill")
             if let text = state.timerText {
                 Text("\(icon) \(text)").monospacedDigit()
             } else {

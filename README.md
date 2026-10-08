@@ -9,12 +9,15 @@ Teams, Calendar, anything that shows a banner — so you notice it even with the
 ## Features
 
 - **Haptic notifications** — a trackpad buzz for every notification banner
-- **Per-app control** — choose which apps buzz; new apps are added automatically
+- **Per-app control** — choose which apps buzz; new apps are added automatically, and ones
+  forwarded from your iPhone or installed as Chrome apps are tagged (iPhone) or (Chrome)
 - **Calls keep buzzing** — incoming calls buzz every 2 seconds until answered or dismissed
+- **Group Burst Alerts** — a busy chat buzzes once, then stays quiet for 10 s to 5 min (your choice);
+  calls always get through
 - **Timer** — 10 / 15 / 20 / 30 / 45 / 60 min, with a countdown in the menu bar and a buzz when it's done
 - **Patterns and strength** — Tap, Double, Notify or Alert; Light, Medium or Strong
-- **Stays out of the way** — quiet when the screen is locked or you've stepped away; ignores the
-  Notification Center panel when you open it yourself
+- **Pause anytime** — pause buzzes for 15 minutes to 2 hours, or until you turn them back on
+- **Stays out of the way** — ignores the Notification Center panel when you open it yourself
 
 ## Requirements
 
